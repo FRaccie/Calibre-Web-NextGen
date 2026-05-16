@@ -507,11 +507,17 @@ def find_duplicate_books_hash(include_dismissed=False, user_id=None):
         meta = {}
         with calibre_db.engine.connect() as conn:
             try:
+                # JOIN books so deleted/orphaned checksum rows are excluded:
+                # book_format_checksums is not cleaned on delete, and in a
+                # churned library the duplicate checksums cluster exactly
+                # where books were removed — without the JOIN groups point
+                # at dead ids and the page rehydrates to nothing.
                 rows = conn.execute(text(
-                    "SELECT checksum, GROUP_CONCAT(DISTINCT book) "
-                    "FROM book_format_checksums "
-                    "WHERE checksum IS NOT NULL AND checksum != '' "
-                    "GROUP BY checksum HAVING COUNT(DISTINCT book) > 1"
+                    "SELECT f.checksum, GROUP_CONCAT(DISTINCT f.book) "
+                    "FROM book_format_checksums f "
+                    "JOIN books b ON b.id = f.book "
+                    "WHERE f.checksum IS NOT NULL AND f.checksum != '' "
+                    "GROUP BY f.checksum HAVING COUNT(DISTINCT f.book) > 1"
                 )).fetchall()
             except Exception as ex:
                 log.warning("[cwa-duplicates] hash scan: book_format_checksums "
