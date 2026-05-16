@@ -32,6 +32,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from . import constants, logger, isoLanguages, services, helper
 from . import db, ub, config, app
 from . import calibre_db, kobo_sync_status
+from .health import core_services_status
 from .search import render_search_results, render_adv_search_results
 from .gdriveutils import getFileFromEbooksFolder, do_gdrive_download
 from .helper import check_valid_domain, check_email, check_username, \
@@ -1052,6 +1053,7 @@ def render_magic_shelf(shelf_id, sort_param, page):
 def health_check():
     uptime = time.time() - _start_time
 
+    db_up = False
     try:
         db_path = os.path.join(cwa_get_library_location(), "metadata.db")
         retries = 3
@@ -1072,11 +1074,25 @@ def health_check():
     except Exception:
         db_up = False
 
+    # Issue #193: a DB SELECT 1 alone reports green while ingest /
+    # metadata-change-detector are dead or the worker is wedged. Also assert
+    # the core supervised services are up. services_ok is True when the s6
+    # tooling is unavailable (dev/test) so only an actual down service can
+    # fail the probe — see cps/health.core_services_status.
+    services_checked, services_ok, services_status = core_services_status()
+
+    healthy = db_up and services_ok
+
     return jsonify({
-        "status": "ok" if db_up else "degraded",
+        "status": "ok" if healthy else "degraded",
         "uptime": uptime,
         "version": f"Calibre-Web-NextGen/{constants.INSTALLED_VERSION}",
-    }), 200 if db_up else 503
+        "checks": {
+            "database": db_up,
+            "services": services_status,
+            "services_checked": services_checked,
+        },
+    }), 200 if healthy else 503
 
 # ################################### View Books list ##################################################################
 
