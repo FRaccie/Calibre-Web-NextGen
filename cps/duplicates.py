@@ -397,9 +397,17 @@ def show_duplicates():
             page_ids.extend(g.get('book_ids') or [])
         books_by_id = {}
         if page_ids:
+            # Eager-load every relation the duplicates template renders so
+            # the page's books don't trigger N+1 lazy loads.
             base_q = (calibre_db.session.query(db.Books)
                       .options(joinedload(db.Books.data))
                       .options(joinedload(db.Books.authors))
+                      .options(joinedload(db.Books.series))
+                      .options(joinedload(db.Books.languages))
+                      .options(joinedload(db.Books.publishers))
+                      .options(joinedload(db.Books.tags))
+                      .options(joinedload(db.Books.identifiers))
+                      .options(joinedload(db.Books.ratings))
                       .filter(get_common_filters(
                           user_id=current_user.id if current_user else None)))
             for b in _fetch_books_in_chunks(base_q, set(page_ids)):

@@ -481,19 +481,49 @@
                   </div>
                   <div class="book-meta">
                     <div><strong>Authors:</strong> {{ book.author_names }}</div>
-                    <div><strong>Added:</strong> {{ book.timestamp.strftime('%Y-%m-%d %H:%M') }}</div>
                     <div><strong>Book ID:</strong> {{ book.id }}</div>
+                    <div><strong>Added:</strong> {{ book.timestamp.strftime('%Y-%m-%d %H:%M') if book.timestamp else '—' }}</div>
+                    {% if book.last_modified %}
+                      <div><strong>Modified:</strong> {{ book.last_modified.strftime('%Y-%m-%d %H:%M') }}</div>
+                    {% endif %}
+                    {% if book.pubdate %}
+                      <div><strong>Published:</strong> {{ book.pubdate.strftime('%Y-%m-%d') }}</div>
+                    {% endif %}
                     {% if book.series %}
-                      <div><strong>Series:</strong> 
-                        {% for series in book.series %}
-                          {{ series.name }}{% if book.series_index %} ({{ book.series_index }}){% endif %}{% if not loop.last %}, {% endif %}
-                        {% endfor %}
+                      <div><strong>Series:</strong>
+                        {% for series in book.series %}{{ series.name }}{% if book.series_index %} ({{ book.series_index }}){% endif %}{% if not loop.last %}, {% endif %}{% endfor %}
+                      </div>
+                    {% endif %}
+                    {% if book.languages %}
+                      <div><strong>Language:</strong>
+                        {% for lang in book.languages %}{{ lang.lang_code }}{% if not loop.last %}, {% endif %}{% endfor %}
+                      </div>
+                    {% endif %}
+                    {% if book.publishers %}
+                      <div><strong>Publisher:</strong>
+                        {% for pub in book.publishers %}{{ pub.name }}{% if not loop.last %}, {% endif %}{% endfor %}
                       </div>
                     {% endif %}
                     {% if book.data %}
-                      <div><strong>Formats:</strong> 
-                        {% for data in book.data %}{{ data.format }}{% if not loop.last %}, {% endif %}{% endfor %}
+                      <div><strong>Formats:</strong>
+                        {% for data in book.data %}{{ data.format }}{% if data.uncompressed_size %} ({{ (data.uncompressed_size / 1048576) | round(2) }} MB){% endif %}{% if not loop.last %}, {% endif %}{% endfor %}
                       </div>
+                    {% endif %}
+                    {% if book.tags %}
+                      <div><strong>Tags:</strong>
+                        {% for tag in book.tags %}{{ tag.name }}{% if not loop.last %}, {% endif %}{% endfor %}
+                      </div>
+                    {% endif %}
+                    {% if book.ratings and book.ratings|length > 0 and book.ratings[0].rating %}
+                      <div><strong>Rating:</strong> {{ (book.ratings[0].rating / 2) | round(1) }}/5</div>
+                    {% endif %}
+                    {% if book.identifiers %}
+                      <div><strong>IDs:</strong>
+                        {% for ident in book.identifiers %}{{ ident.type }}:{{ ident.val }}{% if not loop.last %}, {% endif %}{% endfor %}
+                      </div>
+                    {% endif %}
+                    {% if book.path %}
+                      <div class="book-path" style="word-break:break-all;opacity:.7;font-size:.85em;"><strong>Path:</strong> {{ book.path }}</div>
                     {% endif %}
                   </div>
                   <div class="book-actions">
