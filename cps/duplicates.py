@@ -1526,6 +1526,52 @@ def cancel_scan(task_id):
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+_PREVIEW_GROUP_CAP = 200
+
+
+def _cached_resolution_groups(user_id=None, limit=None):
+    """Resolution-ready duplicate groups built from the cached scan.
+
+    Same {title,author,count,books,group_hash} group shape the live
+    detector yields, but sourced from the cache — NEVER an inline scan (a
+    live 170k scan on the request path wedged the web worker; prod
+    2026-05-16). Returns None if no cached scan exists yet. `limit` caps
+    the number of groups (keeps the preview cheap on huge result sets).
+    """
+    cache = CWA_DB().get_duplicate_cache()
+    if not cache or cache.get('duplicate_groups') is None:
+        return None
+    groups = filter_dismissed_groups(cache['duplicate_groups'], user_id)
+    groups = sorted(groups, key=lambda g: ((g.get('title') or '').lower(),
+                                           (g.get('author') or '').lower()))
+    if limit:
+        groups = groups[:int(limit)]
+    ids = []
+    for g in groups:
+        ids.extend(g.get('book_ids') or [])
+    by_id = {}
+    if ids:
+        base_q = (calibre_db.session.query(db.Books)
+                  .options(joinedload(db.Books.data))
+                  .options(joinedload(db.Books.authors))
+                  .filter(get_common_filters(user_id=user_id)))
+        for b in _fetch_books_in_chunks(base_q, set(ids)):
+            by_id[b.id] = b
+    out = []
+    for g in groups:
+        books = [by_id[i] for i in (g.get('book_ids') or []) if i in by_id]
+        if len(books) < 2:
+            continue
+        out.append({
+            'title': g.get('title', ''),
+            'author': g.get('author', ''),
+            'count': len(books),
+            'books': books,
+            'group_hash': g.get('group_hash', ''),
+        })
+    return out
+
+
 @duplicates.route("/duplicates/preview-resolution", methods=["POST"])
 @login_required_if_no_ano
 @admin_required
@@ -1549,13 +1595,28 @@ def preview_resolution():
             }), 400
         
         print("[cwa-duplicates] Calling auto_resolve_duplicates in dry_run mode...", flush=True)
-        # Note: No duplicate_groups passed - will scan to get fresh data for preview
+        # Use the cached scan (capped) — never scan inline here.
+        groups = _cached_resolution_groups(user_id=current_user.id,
+                                           limit=_PREVIEW_GROUP_CAP)
+        if groups is None:
+            return jsonify({
+                'success': False,
+                'error': _('No cached duplicate scan yet — run a duplicate '
+                           'scan first, then preview resolution.'),
+                'needs_scan': True,
+            })
         result = auto_resolve_duplicates(
             strategy=strategy,
             dry_run=True,
             user_id=current_user.id,
-            trigger_type='manual'
+            trigger_type='manual',
+            duplicate_groups=groups,
         )
+        if isinstance(result, dict):
+            result['preview_capped'] = _PREVIEW_GROUP_CAP
+            result['preview_note'] = _(
+                'Preview limited to the first %(n)s duplicate groups.',
+                n=_PREVIEW_GROUP_CAP)
         
         print(f"[cwa-duplicates] Preview result: {result.get('success', False)}, resolved_count={result.get('resolved_count', 0)}", flush=True)
         return jsonify(result)
@@ -1586,12 +1647,22 @@ def execute_resolution():
                 'error': _('Invalid resolution strategy')
             }), 400
         
-        # Note: No duplicate_groups passed - will scan to get fresh data for execution
+        # Resolve what the last scan found — from cache, never an inline
+        # scan on the request path.
+        groups = _cached_resolution_groups(user_id=current_user.id)
+        if groups is None:
+            return jsonify({
+                'success': False,
+                'error': _('No cached duplicate scan yet — run a duplicate '
+                           'scan first, then execute resolution.'),
+                'needs_scan': True,
+            })
         result = auto_resolve_duplicates(
             strategy=strategy,
             dry_run=False,
             user_id=current_user.id,
-            trigger_type='manual'
+            trigger_type='manual',
+            duplicate_groups=groups,
         )
         
         # Invalidate cache after resolution

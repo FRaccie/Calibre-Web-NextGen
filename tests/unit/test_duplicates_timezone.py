@@ -225,3 +225,23 @@ def test_show_duplicates_is_paginated_not_render_all():
     assert "page_slice" in body, "must slice cached groups to one page"
     assert "set(page_ids)" in body, "must rehydrate only the page's book ids"
     assert "pagination=pagination" in body, "must pass pagination to template"
+
+
+def test_resolution_endpoints_use_cache_not_inline_scan():
+    # "Failed to generate preview": preview/execute auto-resolve called
+    # auto_resolve_duplicates(duplicate_groups=None) -> inline 170k scan ->
+    # request timed out. Both must source groups from the cache helper.
+    src = (pathlib.Path(__file__).resolve().parents[2] / "cps" / "duplicates.py").read_text()
+    for fn in ("preview_resolution", "execute_resolution"):
+        m = re.search(r"\ndef " + fn + r"\(\):.*?(?=\n@duplicates\.route|\ndef [a-zA-Z_])",
+                      src, re.DOTALL)
+        assert m, "could not isolate " + fn
+        b = m.group(0)
+        assert "_cached_resolution_groups(" in b, fn + " must use the cache helper"
+        assert "duplicate_groups=groups" in b, fn + " must pass cached groups (no scan)"
+        assert "find_duplicate_books(" not in b, fn + " must not inline-scan"
+    hm = re.search(r"\ndef _cached_resolution_groups\(.*?(?=\n@duplicates\.route|\ndef [a-zA-Z_])",
+                   src, re.DOTALL)
+    assert hm and "find_duplicate_books(" not in hm.group(0), (
+        "_cached_resolution_groups must read the cache, never scan"
+    )
