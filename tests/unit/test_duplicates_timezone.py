@@ -215,3 +215,13 @@ def test_shared_single_flight_guard_used_by_enqueue():
     assert em and "_duplicate_scan_in_flight()" in em.group(0), (
         "_enqueue_background_duplicate_scan must use the shared single-flight guard"
     )
+
+
+def test_show_duplicates_is_paginated_not_render_all():
+    # Prod: 42,970 groups / 164k books rendered at once -> ~54s, worker
+    # wedged. The page must paginate and rehydrate only the current page.
+    body = _show_duplicates_src()
+    assert "Pagination(" in body and "per_page" in body, "must paginate"
+    assert "page_slice" in body, "must slice cached groups to one page"
+    assert "set(page_ids)" in body, "must rehydrate only the page's book ids"
+    assert "pagination=pagination" in body, "must pass pagination to template"

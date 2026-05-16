@@ -364,24 +364,49 @@ def show_duplicates():
         cached_groups = filter_dismissed_groups(
             cache_data['duplicate_groups'],
             current_user.id if current_user and current_user.id else None)
+        # Stable order on the lightweight cached dicts, BEFORE slicing, so
+        # pagination is deterministic across page loads.
+        cached_groups = sorted(
+            cached_groups,
+            key=lambda g: ((g.get('title') or '').lower(),
+                           (g.get('author') or '').lower()))
 
-        # Rehydrate Book objects only for the bounded set of duplicate ids,
-        # chunked so a large id set can't exceed SQLite's parameter limit.
-        all_ids = []
-        for g in cached_groups:
-            all_ids.extend(g.get('book_ids') or [])
+        # Paginate. Rendering every group at once is infeasible at scale
+        # (a real library produced 42,970 groups / 164k books -> ~54s per
+        # request, web worker wedged). Only the current page's books are
+        # rehydrated, so the request stays cheap regardless of total size.
+        from .pagination import Pagination
+        per_page = 50
+        total_groups = len(cached_groups)
+        try:
+            page = int(request.args.get('page', 1))
+        except (TypeError, ValueError):
+            page = 1
+        pagination = Pagination(page, per_page, total_groups)
+        if page < 1:
+            page = 1
+        elif pagination.pages and page > pagination.pages:
+            page = pagination.pages
+        pagination = Pagination(page, per_page, total_groups)
+        page_slice = cached_groups[(page - 1) * per_page: page * per_page]
+
+        # Rehydrate Book objects only for THIS page's ids (bounded; chunked
+        # so even a pathological page can't exceed SQLite's param limit).
+        page_ids = []
+        for g in page_slice:
+            page_ids.extend(g.get('book_ids') or [])
         books_by_id = {}
-        if all_ids:
+        if page_ids:
             base_q = (calibre_db.session.query(db.Books)
                       .options(joinedload(db.Books.data))
                       .options(joinedload(db.Books.authors))
                       .filter(get_common_filters(
                           user_id=current_user.id if current_user else None)))
-            for b in _fetch_books_in_chunks(base_q, set(all_ids)):
+            for b in _fetch_books_in_chunks(base_q, set(page_ids)):
                 books_by_id[b.id] = b
 
         duplicate_groups = []
-        for g in cached_groups:
+        for g in page_slice:
             books = [books_by_id[i] for i in (g.get('book_ids') or []) if i in books_by_id]
             if len(books) < 2:
                 continue  # books deleted or now hidden by permissions
@@ -394,7 +419,6 @@ def show_duplicates():
                 'books': books,
                 'group_hash': g.get('group_hash', ''),
             })
-        duplicate_groups.sort(key=lambda x: (x['title'].lower(), x['author'].lower()))
 
         # Refresh in the background if the cache is stale or flagged pending.
         try:
@@ -405,10 +429,13 @@ def show_duplicates():
         except Exception as ex:
             log.debug("[cwa-duplicates] staleness check skipped: %s", ex)
 
-        print(f"[cwa-duplicates] Rendered {len(duplicate_groups)} cached groups", flush=True)
-        log.info("[cwa-duplicates] Rendered %s cached duplicate groups", len(duplicate_groups))
+        print(f"[cwa-duplicates] Rendered page {page}/{pagination.pages} "
+              f"({len(duplicate_groups)} of {total_groups} groups)", flush=True)
+        log.info("[cwa-duplicates] Rendered page %s/%s (%s of %s cached groups)",
+                 page, pagination.pages, len(duplicate_groups), total_groups)
         return render_title_template('duplicates.html',
                                      duplicate_groups=duplicate_groups,
+                                     pagination=pagination,
                                      next_scan_run=next_scan_run,
                                      title=_("Duplicate Books"), page="duplicates")
 

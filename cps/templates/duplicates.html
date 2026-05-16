@@ -511,6 +511,20 @@
           </div>
           {% endfor %}
         </div>
+        {% if pagination and pagination.pages > 1 %}
+        <div class="duplicate-pagination" style="margin:16px 0; text-align:center;">
+          {% if pagination.has_prev %}
+          <a class="btn btn-sm btn-default" href="{{ url_for('duplicates.show_duplicates') }}?page={{ pagination.page - 1 }}">&laquo; {{_('Previous')}}</a>
+          {% endif %}
+          <span class="text-muted" style="margin:0 12px;">
+            {{_('Page')}} {{ pagination.page }} / {{ pagination.pages }} &middot;
+            {{ pagination.total_count }} {{_('duplicate groups')}}
+          </span>
+          {% if pagination.has_next %}
+          <a class="btn btn-sm btn-default" href="{{ url_for('duplicates.show_duplicates') }}?page={{ pagination.page + 1 }}">{{_('Next')}} &raquo;</a>
+          {% endif %}
+        </div>
+        {% endif %}
       {% else %}
         <div class="no-duplicates">
           <h3>{{_('No Duplicate Books Found')}}</h3>
