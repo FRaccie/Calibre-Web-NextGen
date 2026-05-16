@@ -1627,7 +1627,19 @@ def cancel_scan(task_id):
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
-_PREVIEW_GROUP_CAP = 200
+def _preview_group_cap():
+    """Max groups detailed in an auto-resolve preview. Capped so the
+    preview can't rehydrate the whole library and wedge the worker;
+    tunable via env for big libraries. Execute still applies to ALL
+    cached groups regardless of this cap."""
+    try:
+        return max(50, min(20000, int(os.environ.get(
+            'CWA_DUPLICATE_PREVIEW_CAP', '2000'))))
+    except (TypeError, ValueError):
+        return 2000
+
+
+_PREVIEW_GROUP_CAP = _preview_group_cap()
 
 
 def _cached_resolution_groups(user_id=None, limit=None):
@@ -1714,10 +1726,25 @@ def preview_resolution():
             duplicate_groups=groups,
         )
         if isinstance(result, dict):
+            total_groups = None
+            try:
+                cache = CWA_DB().get_duplicate_cache()
+                if cache:
+                    total_groups = cache.get('total_count')
+            except Exception:
+                total_groups = None
             result['preview_capped'] = _PREVIEW_GROUP_CAP
-            result['preview_note'] = _(
-                'Preview limited to the first %(n)s duplicate groups.',
-                n=_PREVIEW_GROUP_CAP)
+            result['preview_total_groups'] = total_groups
+            if total_groups and total_groups > _PREVIEW_GROUP_CAP:
+                result['preview_note'] = _(
+                    'Preview details the first %(n)s of %(t)s duplicate '
+                    'groups. Execute applies to all %(t)s.',
+                    n=_PREVIEW_GROUP_CAP, t=total_groups)
+            else:
+                result['preview_note'] = _(
+                    'Preview covers all %(t)s duplicate groups.',
+                    t=(total_groups if total_groups is not None
+                       else len(groups)))
         
         print(f"[cwa-duplicates] Preview result: {result.get('success', False)}, resolved_count={result.get('resolved_count', 0)}", flush=True)
         return jsonify(result)
