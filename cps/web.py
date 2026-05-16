@@ -32,7 +32,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from . import constants, logger, isoLanguages, services, helper
 from . import db, ub, config, app
 from . import calibre_db, kobo_sync_status
-from .health import core_services_status
+from .health import core_services_status, library_storage_status
 from .search import render_search_results, render_adv_search_results
 from .gdriveutils import getFileFromEbooksFolder, do_gdrive_download
 from .helper import check_valid_domain, check_email, check_username, \
@@ -1074,12 +1074,16 @@ def health_check():
     except Exception:
         db_up = False
 
-    # Issue #193: a DB SELECT 1 alone reports green while ingest /
-    # metadata-change-detector are dead or the worker is wedged. Also assert
-    # the core supervised services are up. services_ok is True when the s6
+    # Issue #193: a DB SELECT 1 alone reports green while a core longrun
+    # service is dead or the worker is wedged. Assert all longrun s6
+    # services (svc-calibre-web-automated, ingest, metadata-change-detector,
+    # auto-zipper, preview-cache-cleanup). services_ok is True when the s6
     # tooling is unavailable (dev/test) so only an actual down service can
     # fail the probe — see cps/health.core_services_status.
     services_checked, services_ok, services_status = core_services_status()
+
+    # Informational only: never gates health (a restart can't free disk).
+    storage = library_storage_status(cwa_get_library_location())
 
     healthy = db_up and services_ok
 
@@ -1091,6 +1095,7 @@ def health_check():
             "database": db_up,
             "services": services_status,
             "services_checked": services_checked,
+            "storage": storage,
         },
     }), 200 if healthy else 503
 
