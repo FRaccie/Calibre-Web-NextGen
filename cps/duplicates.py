@@ -695,7 +695,11 @@ def find_duplicate_books_sql(use_title, use_author, use_language, use_series, us
                       .filter(get_common_filters(user_id=user_id)))
         books = _fetch_books_in_chunks(books_base, book_ids)
         # Re-apply ORDER BY timestamp DESC (NULLs last) across batches.
-        books.sort(key=lambda b: (b.timestamp is not None, b.timestamp), reverse=True)
+        # tz-safe key: mixed naive/aware timestamps otherwise raise
+        # "can't compare offset-naive and offset-aware datetimes" — the DB
+        # ORDER BY tolerated it, Python's sort does not.
+        books.sort(key=lambda b: _timestamp_or_default(b.timestamp, _AWARE_MIN),
+                   reverse=True)
         
         if len(books) < 2:
             continue  # Safety check
@@ -823,7 +827,11 @@ def find_duplicate_books_python(use_title, use_author, use_language, use_series,
         all_books = _fetch_books_in_chunks(books_query, candidate_ids)
         # Per-batch queries can only order within a batch; restore the global
         # ORDER BY title ASC, timestamp DESC (NULLs last) via a stable sort.
-        all_books.sort(key=lambda b: (b.timestamp is not None, b.timestamp), reverse=True)
+        # tz-safe key: mixed naive/aware timestamps otherwise raise
+        # "can't compare offset-naive and offset-aware datetimes" — the DB
+        # ORDER BY tolerated it, Python's sort does not.
+        all_books.sort(key=lambda b: _timestamp_or_default(b.timestamp, _AWARE_MIN),
+                        reverse=True)
         all_books.sort(key=lambda b: (b.title or ""))
     else:
         all_books = books_query.all()
