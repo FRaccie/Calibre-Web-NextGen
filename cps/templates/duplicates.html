@@ -471,7 +471,7 @@
                 
                 <div class="book-cover">
                   <a href="{{ url_for('web.show_book', book_id=book.id) }}" title="{{_('View book details')}}">
-                    <img src="{{ url_for('web.get_cover', book_id=book.id, resolution='og', c=book|last_modified) }}" alt="Cover for {{ book.title }}" onerror="this.onerror=null;this.src='{{ url_for('static', filename='generic_cover.svg') }}'">
+                    <img src="{{ url_for('web.get_cover', book_id=book.id, resolution='sm', c=book|last_modified) }}" alt="Cover for {{ book.title }}" loading="lazy" decoding="async" onerror="this.onerror=null;this.src='{{ url_for('static', filename='generic_cover.svg') }}'">
                   </a>
                 </div>
                 
