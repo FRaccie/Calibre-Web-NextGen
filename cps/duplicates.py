@@ -476,6 +476,92 @@ def get_next_duplicate_scan_run(settings):
         return None
 
 
+class _BookId:
+    """Minimal stand-in: the cache serializer only reads `.id`, so the hash
+    scan needn't rehydrate full ORM objects (rehydration is page-bounded at
+    render time)."""
+    __slots__ = ('id',)
+
+    def __init__(self, book_id):
+        self.id = book_id
+
+
+def find_duplicate_books_hash(include_dismissed=False, user_id=None):
+    """Exact-duplicate detection from stored per-file KOReader checksums.
+
+    Groups books that share an identical file checksum
+    (metadata.db `book_format_checksums`, backfilled at ingest/boot for
+    KOReader sync). Pure SQL GROUP BY -> O(n), no Python title matching,
+    cannot wedge the worker. Catches byte-identical files (the common
+    accidental re-import / double-add); it does NOT catch
+    same-work-different-bytes — that needs the fuzzy method.
+    """
+    import time
+    t0 = time.perf_counter()
+    try:
+        from sqlalchemy import text
+    except Exception:
+        return []
+    try:
+        parsed = []
+        meta = {}
+        with calibre_db.engine.connect() as conn:
+            try:
+                rows = conn.execute(text(
+                    "SELECT checksum, GROUP_CONCAT(DISTINCT book) "
+                    "FROM book_format_checksums "
+                    "WHERE checksum IS NOT NULL AND checksum != '' "
+                    "GROUP BY checksum HAVING COUNT(DISTINCT book) > 1"
+                )).fetchall()
+            except Exception as ex:
+                log.warning("[cwa-duplicates] hash scan: book_format_checksums "
+                            "unavailable (%s) — enable KOReader sync / checksum "
+                            "backfill, or use a metadata scan method", ex)
+                print("[cwa-duplicates] hash scan: no book_format_checksums "
+                      "table/rows; returning 0 groups", flush=True)
+                return []
+            rep_ids = []
+            for checksum, ids_csv in rows:
+                ids = sorted({int(x) for x in str(ids_csv).split(',') if x.strip()})
+                if len(ids) < 2:
+                    continue
+                parsed.append((str(checksum), ids))
+                rep_ids.append(ids[0])
+            for start in range(0, len(rep_ids), _SQLITE_IN_CHUNK):
+                chunk = rep_ids[start:start + _SQLITE_IN_CHUNK]
+                if not chunk:
+                    continue
+                in_list = ",".join(str(int(i)) for i in chunk)
+                for bid, title, author in conn.execute(text(
+                        "SELECT id, title, author_sort FROM books "
+                        f"WHERE id IN ({in_list})")).fetchall():
+                    meta[bid] = (title or '', author or '')
+        groups = []
+        for checksum, ids in parsed:
+            title, author = meta.get(ids[0], ('', ''))
+            groups.append({
+                'title': title,
+                'author': author,
+                'count': len(ids),
+                'books': [_BookId(i) for i in ids],
+                'group_hash': checksum,
+            })
+        groups.sort(key=lambda g: ((g['title'] or '').lower(),
+                                   (g['author'] or '').lower()))
+        if not include_dismissed:
+            groups = filter_dismissed_groups(groups, user_id)
+        dur = time.perf_counter() - t0
+        log.info("[cwa-duplicates] hash scan: %s exact-dup groups in %.2fs",
+                 len(groups), dur)
+        print(f"[cwa-duplicates] hash scan: {len(groups)} exact-dup groups "
+              f"in {dur:.2f}s", flush=True)
+        return groups
+    except Exception as ex:
+        log.error("[cwa-duplicates] hash scan failed: %s", ex)
+        print(f"[cwa-duplicates] hash scan failed: {ex}", flush=True)
+        return []
+
+
 def find_duplicate_books(include_dismissed=False, user_id=None):
     """Find books with duplicate combinations based on configurable criteria
     
@@ -521,7 +607,7 @@ def find_duplicate_books(include_dismissed=False, user_id=None):
             'duplicate_detection_publisher': 0,
             'duplicate_detection_format': 0,
             'duplicate_detection_use_sql': 1,
-            'duplicate_scan_method': 'hybrid'
+            'duplicate_scan_method': 'hash'
         }
     
     # Extract duplicate detection criteria
@@ -534,8 +620,15 @@ def find_duplicate_books(include_dismissed=False, user_id=None):
     
     # Check SQL method preference
     use_sql = settings.get('duplicate_detection_use_sql', 1)
-    scan_method = settings.get('duplicate_scan_method', 'auto')
-    
+    scan_method = settings.get('duplicate_scan_method', 'hash')
+
+    # Fast exact-duplicate tier: stored per-file checksums, pure SQL
+    # GROUP BY. Default. O(n), can't wedge the worker. The metadata
+    # methods below remain available for fuzzy/cross-edition matching.
+    if scan_method == 'hash':
+        return find_duplicate_books_hash(include_dismissed=include_dismissed,
+                                         user_id=user_id)
+
     # Ensure at least one criterion is selected (fallback to title+author if none selected)
     if not any([use_title, use_author, use_language, use_series, use_publisher, use_format]):
         print("[cwa-duplicates] Warning: No duplicate detection criteria selected, falling back to title+author", flush=True)

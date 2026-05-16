@@ -245,3 +245,28 @@ def test_resolution_endpoints_use_cache_not_inline_scan():
     assert hm and "find_duplicate_books(" not in hm.group(0), (
         "_cached_resolution_groups must read the cache, never scan"
     )
+
+
+def test_hash_scan_path_exists_and_is_default():
+    src = (pathlib.Path(__file__).resolve().parents[2] / "cps" / "duplicates.py").read_text()
+    assert "def find_duplicate_books_hash(" in src, "hash tier function required"
+    assert "book_format_checksums" in src and "GROUP BY checksum" in src, (
+        "hash tier must group by stored per-file checksums"
+    )
+    fdb = re.search(r"\ndef find_duplicate_books\(.*?(?=\ndef find_duplicate_candidate_ids_sql|\ndef [a-zA-Z_])",
+                    src, re.DOTALL)
+    assert fdb and "if scan_method == 'hash':" in fdb.group(0), (
+        "find_duplicate_books must short-circuit to the hash tier"
+    )
+    assert "settings.get('duplicate_scan_method', 'hash')" in src, "hash must be the default method"
+
+
+def test_hash_scan_handles_missing_checksum_table():
+    # No book_format_checksums (KOReader sync off) must return [] cleanly,
+    # never raise into the scan/page.
+    src = (pathlib.Path(__file__).resolve().parents[2] / "cps" / "duplicates.py").read_text()
+    m = re.search(r"\ndef find_duplicate_books_hash\(.*?(?=\ndef find_duplicate_books\()",
+                  src, re.DOTALL)
+    assert m
+    b = m.group(0)
+    assert "unavailable" in b and "return []" in b, "must degrade gracefully"
