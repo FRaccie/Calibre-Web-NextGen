@@ -149,6 +149,30 @@ def test_mixed_tz_sort_key_totally_orders_without_error():
     assert ordered[-1].timestamp is None
 
 
+def _show_duplicates_src():
+    src = (pathlib.Path(__file__).resolve().parents[2] / "cps" / "duplicates.py").read_text()
+    m = re.search(r"\ndef show_duplicates\(\):.*?(?=\n@duplicates\.route|\ndef [a-zA-Z_])",
+                  src, re.DOTALL)
+    assert m, "could not isolate show_duplicates()"
+    return m.group(0)
+
+
+def test_show_duplicates_never_scans_inline():
+    # Prod incident 2026-05-16: a live find_duplicate_books() on the
+    # request path pegged the single web worker on a 170k-book library,
+    # /health timed out, container flapped unhealthy. The page must serve
+    # the cache and refresh via a background WorkerThread task only.
+    body = _show_duplicates_src()
+    assert "find_duplicate_books(" not in body, (
+        "show_duplicates must NOT call find_duplicate_books inline — "
+        "serve cache + background scan"
+    )
+    assert "get_duplicate_cache()" in body, "must read the cached scan result"
+    assert "_enqueue_background_duplicate_scan(" in body, (
+        "must refresh via the background WorkerThread task"
+    )
+
+
 def test_chunked_resort_uses_tz_safe_key_not_raw_timestamp():
     src = (pathlib.Path(__file__).resolve().parents[2] / "cps" / "duplicates.py").read_text()
     # Both _fetch_books_in_chunks re-sorts must go through the tz-safe helper.
