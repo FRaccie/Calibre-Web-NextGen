@@ -376,7 +376,7 @@ def show_duplicates():
         # request, web worker wedged). Only the current page's books are
         # rehydrated, so the request stays cheap regardless of total size.
         from .pagination import Pagination
-        per_page = 50
+        per_page = 10
         total_groups = len(cached_groups)
         try:
             page = int(request.args.get('page', 1))
