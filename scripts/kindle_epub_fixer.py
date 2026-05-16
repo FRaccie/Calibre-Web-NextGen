@@ -119,26 +119,42 @@ def exit_if_cancelled() -> None:
         sys.exit(0)
 
 ### LOCK FILES
-# Creates a lock file unless one already exists meaning an instance of the script is
-# already running, then the script is closed, the user is notified and the program
-# exits with code 2
-try:
-    lock = open(tempfile.gettempdir() + '/kindle_epub_fixer.lock', 'x')
-    lock.close()
-except FileExistsError:
-    print_and_log("[cwa-kindle-epub-fixer] CANCELLING... kindle-epub-fixer was initiated but is already running")
-    logger.info(f"\nNextGen Kindle EPUB Fixer Service - Run Ended: {datetime.now()}")
-    sys.exit(2)
+# Single-instance guard for the kindle-epub-fixer *script*. This must be
+# acquired by the CLI entrypoint only (see acquire_singleton_lock(), called
+# from main()) — NOT as an import side effect. This module is also imported
+# as a library (scripts/convert_library.py, the ingest processor, and the
+# test suite); acquiring a lock keyed on a shared tempdir path at import time
+# made parallel importers (e.g. pytest-xdist workers) collide on the same
+# file and sys.exit(2), and a hard-killed run would strand the lock and
+# block every future fix until it was removed by hand.
+LOCK_PATH = os.path.join(tempfile.gettempdir(), 'kindle_epub_fixer.lock')
+
 
 # Defining function to delete the lock on script exit
 def removeLock():
     try:
-        os.remove(tempfile.gettempdir() + '/kindle_epub_fixer.lock')
+        os.remove(LOCK_PATH)
     except FileNotFoundError:
         ...
 
-# Will automatically run when the script exits
-atexit.register(removeLock)
+
+def acquire_singleton_lock():
+    """Refuse to run if another kindle-epub-fixer instance is already running.
+
+    Creates an exclusive lock file; if it already exists the script is
+    cancelled and the process exits with code 2 (unchanged behavior and
+    contract — cps/cwa_functions.py cleans up the same path). atexit cleanup
+    is registered only once the lock is actually held, so importers that
+    never call this leave no lock behind.
+    """
+    try:
+        lock = open(LOCK_PATH, 'x')
+        lock.close()
+    except FileExistsError:
+        print_and_log("[cwa-kindle-epub-fixer] CANCELLING... kindle-epub-fixer was initiated but is already running")
+        logger.info(f"\nNextGen Kindle EPUB Fixer Service - Run Ended: {datetime.now()}")
+        sys.exit(2)
+    atexit.register(removeLock)
 
 
 class EPUBFixer:
@@ -1152,6 +1168,8 @@ def get_all_epubs_in_library() -> list[str]:
 
 
 def main():
+    # Single-instance guard — acquired here (CLI entrypoint), never at import.
+    acquire_singleton_lock()
     parser = argparse.ArgumentParser(
         prog='kindle-epub-fixer',
         description='Checks the encoding of a given EPUB file and automatically corrects any errors that could \
