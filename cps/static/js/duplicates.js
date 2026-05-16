@@ -506,6 +506,32 @@ $(document).ready(function() {
         });
     });
 
+    // On load: if a duplicate scan is already running/queued (started by
+    // the page auto-refresh, an after-import trigger, a scheduled run, or
+    // another tab/user), attach to it so the UI shows live progress
+    // without the user clicking anything — and the Scan button stays
+    // locked so a second scan can't be stacked.
+    (function attachToInFlightScan() {
+        $.ajax({
+            url: '/duplicates/scan-status',
+            type: 'GET',
+            dataType: 'json',
+            success: function(s) {
+                if (s && s.success && s.in_flight && s.task_id) {
+                    var btn = $('#trigger_scan');
+                    btn.prop('disabled', true);
+                    btn.html('<span class="glyphicon glyphicon-refresh glyphicon-spin"></span> Scanning...');
+                    updateProgressUI(s.progress || 0,
+                        s.message || (s.running ? 'Scanning for duplicates…' : 'Queued…'));
+                    pollScanProgress(s.task_id, btn);
+                }
+            },
+            error: function(xhr, status, error) {
+                console.error('[CWA Duplicates] scan-status check failed:', error);
+            }
+        });
+    })();
+
     // Cancel scan
     $('#cancel_scan').on('click', function() {
         if (!activeScanTaskId) {

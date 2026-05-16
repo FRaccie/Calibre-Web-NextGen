@@ -277,17 +277,14 @@ _BG_SCAN_THROTTLE_SECONDS = 60
 _last_bg_scan_enqueue = 0.0
 
 
-def _enqueue_background_duplicate_scan(full_scan=False):
-    """Queue a duplicate scan on the WorkerThread — never run it inline.
+def _duplicate_scan_in_flight():
+    """Return the active TaskDuplicateScan (waiting or running), else None.
 
-    A live scan over a large library holds the GIL/SQLite for the whole
-    request, wedging the single web worker (the /health probe then times
-    out and the container goes unhealthy). Deduped (skips if a
-    TaskDuplicateScan is already waiting/running) and throttled as a
-    backstop so repeated page loads cannot stack scans. Best-effort —
-    never raises into the request.
+    Single source of truth for "a duplicate scan is already happening",
+    shared by every enqueue path (page auto-refresh, manual trigger,
+    after-import) so two scans can never run at once regardless of the
+    trigger. Best-effort — returns None on any error rather than raising.
     """
-    global _last_bg_scan_enqueue
     try:
         from .services.worker import STAT_WAITING, STAT_STARTED
         from .tasks.duplicate_scan import TaskDuplicateScan
@@ -295,17 +292,39 @@ def _enqueue_background_duplicate_scan(full_scan=False):
         for entry in list(getattr(worker, 'tasks', []) or []):
             t = entry[3]
             if isinstance(t, TaskDuplicateScan) and t.stat in (STAT_WAITING, STAT_STARTED):
-                return  # one already pending/running
+                return t
+    except Exception as ex:
+        log.debug("[cwa-duplicates] in-flight check failed: %s", ex)
+    return None
+
+
+def _enqueue_background_duplicate_scan(full_scan=False):
+    """Queue a duplicate scan on the WorkerThread — never run it inline.
+
+    A live scan over a large library holds the GIL/SQLite for the whole
+    request, wedging the single web worker (the /health probe then times
+    out and the container goes unhealthy). Single-flight via
+    _duplicate_scan_in_flight() plus a throttle backstop so repeated page
+    loads cannot stack scans. Best-effort — never raises into the request.
+    Returns the queued/running task, or None on failure.
+    """
+    global _last_bg_scan_enqueue
+    try:
+        running = _duplicate_scan_in_flight()
+        if running is not None:
+            return running  # one already pending/running — never stack
         now = time.time()
         if now - _last_bg_scan_enqueue < _BG_SCAN_THROTTLE_SECONDS:
-            return
-        WorkerThread.add('System',
-                         TaskDuplicateScan(full_scan=full_scan, trigger_type='manual'),
-                         hidden=False)
+            return None
+        from .tasks.duplicate_scan import TaskDuplicateScan
+        task = TaskDuplicateScan(full_scan=full_scan, trigger_type='manual')
+        WorkerThread.add('System', task, hidden=False)
         _last_bg_scan_enqueue = now
         log.info("[cwa-duplicates] Queued background duplicate scan (full_scan=%s)", full_scan)
+        return task
     except Exception as ex:
         log.warning("[cwa-duplicates] Could not queue background duplicate scan: %s", ex)
+        return None
 
 
 @duplicates.route("/duplicates")
@@ -1335,89 +1354,42 @@ def invalidate_cache():
 @login_required_if_no_ano
 @admin_or_edit_required
 def trigger_scan():
-    """Manually trigger a duplicate scan"""
+    """Manually trigger a duplicate scan (single-flight, never inline).
+
+    If a scan is already queued/running this returns already_running
+    instead of stacking a second one. The scan ALWAYS runs on the
+    WorkerThread — this endpoint must never call the live scan on the
+    request path (that wedged the single web worker on large libraries;
+    prod incident 2026-05-16).
+    """
     try:
-        # Invalidate cache and run fresh scan
+        running = _duplicate_scan_in_flight()
+        if running is not None:
+            return jsonify({
+                'success': True,
+                'already_running': True,
+                'queued': True,
+                'task_id': str(getattr(running, 'id', '') or ''),
+                'message': _('A duplicate scan is already running'),
+            })
+
         cwa_db = CWA_DB()
         cwa_db.invalidate_duplicate_cache()
 
-        # Queue background task
-        try:
-            from cps.tasks.duplicate_scan import TaskDuplicateScan
-            task = TaskDuplicateScan(full_scan=True, trigger_type='manual', user_id=current_user.id)
-            WorkerThread.add(current_user.name, task, hidden=False)
+        from cps.tasks.duplicate_scan import TaskDuplicateScan
+        task = TaskDuplicateScan(full_scan=True, trigger_type='manual',
+                                 user_id=current_user.id)
+        WorkerThread.add(current_user.name, task, hidden=False)
+        log.info("[cwa-duplicates] Manual scan queued by user %s (task_id=%s)",
+                 current_user.name, task.id)
+        print(f"[cwa-duplicates] Manual scan queued for user {current_user.name}, task_id={task.id}", flush=True)
+        return jsonify({
+            'success': True,
+            'message': _('Duplicate scan queued'),
+            'task_id': str(task.id),
+            'queued': True,
+        })
 
-            log.info("[cwa-duplicates] Manual scan queued by user %s (task_id=%s)", 
-                    current_user.name, task.id)
-            print(f"[cwa-duplicates] Manual scan queued for user {current_user.name}, task_id={task.id}", flush=True)
-
-            return jsonify({
-                'success': True,
-                'message': _('Duplicate scan queued'),
-                'task_id': str(task.id),
-                'queued': True
-            })
-        except Exception as e:
-            log.error("[cwa-duplicates] Failed to queue scan task, falling back to sync scan: %s", str(e))
-            print(f"[cwa-duplicates] Failed to queue task, using fallback: {str(e)}", flush=True)
-
-            # Fallback to synchronous scan to avoid hard failures
-            duplicate_groups = find_duplicate_books(include_dismissed=False)
-            max_book_id = 0
-            try:
-                max_id_result = calibre_db.session.query(func.max(db.Books.id)).scalar()
-                max_book_id = max_id_result if max_id_result is not None else 0
-            except Exception as ex:
-                log.warning("[cwa-duplicates] Could not get max book ID in trigger_scan fallback: %s", str(ex))
-
-            all_groups = find_duplicate_books(include_dismissed=True)
-            cwa_db.update_duplicate_cache(all_groups, len(all_groups), max_book_id)
-
-            # Check if auto-resolution is enabled for fallback sync scan
-            if len(duplicate_groups) > 0:
-                try:
-                    auto_resolve_enabled = cwa_db.cwa_settings.get('duplicate_auto_resolve_enabled', 0)
-                    auto_resolve_strategy = cwa_db.cwa_settings.get('duplicate_auto_resolve_strategy', 'newest')
-                    
-                    if auto_resolve_enabled:
-                        log.info("[cwa-duplicates] Auto-resolution enabled in fallback, triggering with strategy: %s", 
-                                auto_resolve_strategy)
-                        print(f"[cwa-duplicates] Fallback scan complete, triggering auto-resolution (strategy: {auto_resolve_strategy})", 
-                              flush=True)
-                        
-                        # Pass the pre-scanned duplicate groups to avoid re-scanning
-                        result = auto_resolve_duplicates(
-                            strategy=auto_resolve_strategy,
-                            dry_run=False,
-                            user_id=current_user.id if current_user else None,
-                            trigger_type='manual',
-                            duplicate_groups=duplicate_groups
-                        )
-                        
-                        if result['success'] and result['resolved_count'] > 0:
-                            log.info("[cwa-duplicates] Fallback auto-resolution completed: resolved=%s, kept=%s, deleted=%s",
-                                    result['resolved_count'], result['kept_count'], result['deleted_count'])
-                            print(f"[cwa-duplicates] Fallback auto-resolution completed: {result['resolved_count']} groups resolved", 
-                                  flush=True)
-                            
-                            # Re-scan to get updated counts after resolution
-                            duplicate_groups = find_duplicate_books(include_dismissed=False)
-                            all_groups = find_duplicate_books(include_dismissed=True)
-                            cwa_db.update_duplicate_cache(all_groups, len(all_groups), max_book_id)
-                            log.debug("[cwa-duplicates] Cache refreshed after fallback auto-resolution")
-                except Exception as ex:
-                    log.error("[cwa-duplicates] Error during fallback auto-resolution: %s", str(ex))
-                    print(f"[cwa-duplicates] Fallback auto-resolution error: {str(ex)}", flush=True)
-
-            return jsonify({
-                'success': True,
-                'message': _('Duplicate scan completed (fallback)'),
-                'count': len(duplicate_groups),
-                'fallback': True,
-                'queued': False,
-                'fallback_reason': str(e)
-            })
-        
     except Exception as e:
         log.error("[cwa-duplicates] Error triggering scan: %s", str(e))
         return jsonify({
@@ -1464,6 +1436,51 @@ def scan_progress(task_id):
         })
     except Exception as e:
         log.error("[cwa-duplicates] Error fetching scan progress: %s", str(e))
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@duplicates.route("/duplicates/scan-status", methods=['GET'])
+@login_required_if_no_ano
+@admin_or_edit_required
+def scan_status():
+    """Live, task-id-less scan status for the /duplicates UI poller.
+
+    Cheap (no scan): the in-flight TaskDuplicateScan via the shared
+    single-flight guard, plus the last completed result from the cache.
+    """
+    try:
+        from .services.worker import STAT_WAITING
+        task = _duplicate_scan_in_flight()
+        running = task is not None and task.stat != STAT_WAITING
+        queued = task is not None and task.stat == STAT_WAITING
+
+        last_ts = None
+        last_count = 0
+        scan_pending = False
+        try:
+            cache = CWA_DB().get_duplicate_cache()
+            if cache:
+                last_ts = cache.get('scan_timestamp')
+                last_count = cache.get('total_count') or 0
+                scan_pending = bool(cache.get('scan_pending'))
+        except Exception as ex:
+            log.debug("[cwa-duplicates] scan-status cache read failed: %s", ex)
+
+        return jsonify({
+            'success': True,
+            'running': running,
+            'queued': queued,
+            'in_flight': task is not None,
+            'task_id': str(getattr(task, 'id', '') or '') if task else None,
+            'progress': float(getattr(task, 'progress', 0) or 0) if task else None,
+            'message': getattr(task, 'message', '') if task else '',
+            'result_count': getattr(task, 'result_count', None) if task else None,
+            'last_scan_timestamp': last_ts,
+            'last_total_count': last_count,
+            'scan_pending': scan_pending,
+        })
+    except Exception as e:
+        log.error("[cwa-duplicates] Error in scan-status: %s", str(e))
         return jsonify({'success': False, 'error': str(e)}), 500
 
 

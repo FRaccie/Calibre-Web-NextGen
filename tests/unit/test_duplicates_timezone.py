@@ -184,3 +184,34 @@ def test_chunked_resort_uses_tz_safe_key_not_raw_timestamp():
         "raw mixed-tz sort key reintroduced — will 500 /duplicates on mixed "
         "naive/aware Books.timestamp"
     )
+
+
+def test_trigger_scan_is_single_flight_and_never_inline():
+    # Prevent dual scans + never run the live scan on the request path.
+    src = (pathlib.Path(__file__).resolve().parents[2] / "cps" / "duplicates.py").read_text()
+    m = re.search(r"\ndef trigger_scan\(\):.*?(?=\n@duplicates\.route|\ndef [a-zA-Z_])",
+                  src, re.DOTALL)
+    assert m, "could not isolate trigger_scan()"
+    body = m.group(0)
+    assert "_duplicate_scan_in_flight()" in body, "trigger_scan must single-flight"
+    assert "already_running" in body, "must report already_running, not stack"
+    assert "find_duplicate_books(" not in body, (
+        "trigger_scan must not run the live scan inline (wedges the worker)"
+    )
+
+
+def test_scan_status_endpoint_exists():
+    src = (pathlib.Path(__file__).resolve().parents[2] / "cps" / "duplicates.py").read_text()
+    assert '"/duplicates/scan-status"' in src and "def scan_status(" in src, (
+        "task-id-less /duplicates/scan-status endpoint required for the live UI"
+    )
+
+
+def test_shared_single_flight_guard_used_by_enqueue():
+    src = (pathlib.Path(__file__).resolve().parents[2] / "cps" / "duplicates.py").read_text()
+    assert "def _duplicate_scan_in_flight(" in src
+    em = re.search(r"\ndef _enqueue_background_duplicate_scan\(.*?(?=\n@duplicates\.route|\ndef [a-zA-Z_])",
+                   src, re.DOTALL)
+    assert em and "_duplicate_scan_in_flight()" in em.group(0), (
+        "_enqueue_background_duplicate_scan must use the shared single-flight guard"
+    )
