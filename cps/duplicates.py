@@ -273,56 +273,132 @@ def filter_dismissed_groups(duplicate_groups, user_id=None):
         return duplicate_groups
 
 
+_BG_SCAN_THROTTLE_SECONDS = 60
+_last_bg_scan_enqueue = 0.0
+
+
+def _enqueue_background_duplicate_scan(full_scan=False):
+    """Queue a duplicate scan on the WorkerThread — never run it inline.
+
+    A live scan over a large library holds the GIL/SQLite for the whole
+    request, wedging the single web worker (the /health probe then times
+    out and the container goes unhealthy). Deduped (skips if a
+    TaskDuplicateScan is already waiting/running) and throttled as a
+    backstop so repeated page loads cannot stack scans. Best-effort —
+    never raises into the request.
+    """
+    global _last_bg_scan_enqueue
+    try:
+        from .services.worker import STAT_WAITING, STAT_STARTED
+        from .tasks.duplicate_scan import TaskDuplicateScan
+        worker = WorkerThread.get_instance()
+        for entry in list(getattr(worker, 'tasks', []) or []):
+            t = entry[3]
+            if isinstance(t, TaskDuplicateScan) and t.stat in (STAT_WAITING, STAT_STARTED):
+                return  # one already pending/running
+        now = time.time()
+        if now - _last_bg_scan_enqueue < _BG_SCAN_THROTTLE_SECONDS:
+            return
+        WorkerThread.add('System',
+                         TaskDuplicateScan(full_scan=full_scan, trigger_type='manual'),
+                         hidden=False)
+        _last_bg_scan_enqueue = now
+        log.info("[cwa-duplicates] Queued background duplicate scan (full_scan=%s)", full_scan)
+    except Exception as ex:
+        log.warning("[cwa-duplicates] Could not queue background duplicate scan: %s", ex)
+
+
 @duplicates.route("/duplicates")
 @login_required_if_no_ano
 @admin_or_edit_required
 def show_duplicates():
-    """Display books with duplicate titles and authors"""
+    """Display books with duplicate titles and authors.
+
+    Serves the cached scan result and refreshes via a background
+    WorkerThread task. It MUST NOT run the live duplicate scan inline: on a
+    large library that scan pegs the single web worker for the whole
+    request, the /health probe times out, and the container flaps
+    unhealthy (production incident, 2026-05-16).
+    """
     print("[cwa-duplicates] Loading duplicates page...", flush=True)
     log.info("[cwa-duplicates] Loading duplicates page for user: %s", current_user.name)
-    
+
     try:
-        # Use SQL/Python detection to find all duplicates once, then filter for current user
-        all_groups = find_duplicate_books(include_dismissed=True)
-        duplicate_groups = filter_dismissed_groups(all_groups, current_user.id if current_user else None)
-
-        # Update cache so notifications reflect the latest scan
-        try:
-            max_book_id = 0
-            try:
-                max_id_result = calibre_db.session.query(func.max(db.Books.id)).scalar()
-                max_book_id = max_id_result if max_id_result is not None else 0
-            except Exception as max_ex:
-                log.warning("[cwa-duplicates] Could not get max book ID for cache update: %s", str(max_ex))
-
-            cwa_db_cache = CWA_DB()
-            cwa_db_cache.update_duplicate_cache(all_groups, len(all_groups), max_book_id)
-            log.debug("[cwa-duplicates] Cache updated from /duplicates page load")
-        except Exception as cache_ex:
-            log.warning("[cwa-duplicates] Failed to update cache from /duplicates page: %s", str(cache_ex))
-
-        # Compute next scheduled scan run
         cwa_db = CWA_DB()
+        if not cwa_db.cwa_settings.get('duplicate_detection_enabled', 1):
+            return render_title_template('duplicates.html', duplicate_groups=[],
+                                         next_scan_run=None,
+                                         title=_("Duplicate Books"), page="duplicates")
+
         next_scan_run = get_next_duplicate_scan_run(cwa_db.cwa_settings)
-        
-        print(f"[cwa-duplicates] Found {len(duplicate_groups)} duplicate groups total", flush=True)
-        log.info("[cwa-duplicates] Found %s duplicate groups total", len(duplicate_groups))
-        
-        return render_title_template('duplicates.html', 
+        cache_data = cwa_db.get_duplicate_cache()
+
+        if not cache_data or cache_data.get('duplicate_groups') is None:
+            # No cached result yet — kick a background scan, render empty.
+            _enqueue_background_duplicate_scan(full_scan=True)
+            log.info("[cwa-duplicates] No cache — queued background scan, rendering empty")
+            return render_title_template('duplicates.html', duplicate_groups=[],
+                                         next_scan_run=next_scan_run,
+                                         scan_in_progress=True,
+                                         title=_("Duplicate Books"), page="duplicates")
+
+        cached_groups = filter_dismissed_groups(
+            cache_data['duplicate_groups'],
+            current_user.id if current_user and current_user.id else None)
+
+        # Rehydrate Book objects only for the bounded set of duplicate ids,
+        # chunked so a large id set can't exceed SQLite's parameter limit.
+        all_ids = []
+        for g in cached_groups:
+            all_ids.extend(g.get('book_ids') or [])
+        books_by_id = {}
+        if all_ids:
+            base_q = (calibre_db.session.query(db.Books)
+                      .options(joinedload(db.Books.data))
+                      .options(joinedload(db.Books.authors))
+                      .filter(get_common_filters(
+                          user_id=current_user.id if current_user else None)))
+            for b in _fetch_books_in_chunks(base_q, set(all_ids)):
+                books_by_id[b.id] = b
+
+        duplicate_groups = []
+        for g in cached_groups:
+            books = [books_by_id[i] for i in (g.get('book_ids') or []) if i in books_by_id]
+            if len(books) < 2:
+                continue  # books deleted or now hidden by permissions
+            books.sort(key=lambda b: _timestamp_or_default(b.timestamp, _AWARE_MIN),
+                       reverse=True)
+            duplicate_groups.append({
+                'title': g.get('title', ''),
+                'author': g.get('author', ''),
+                'count': len(books),
+                'books': books,
+                'group_hash': g.get('group_hash', ''),
+            })
+        duplicate_groups.sort(key=lambda x: (x['title'].lower(), x['author'].lower()))
+
+        # Refresh in the background if the cache is stale or flagged pending.
+        try:
+            max_id = calibre_db.session.query(func.max(db.Books.id)).scalar() or 0
+            if cache_data.get('scan_pending') or \
+               int(cache_data.get('last_scanned_book_id') or 0) < int(max_id):
+                _enqueue_background_duplicate_scan(full_scan=False)
+        except Exception as ex:
+            log.debug("[cwa-duplicates] staleness check skipped: %s", ex)
+
+        print(f"[cwa-duplicates] Rendered {len(duplicate_groups)} cached groups", flush=True)
+        log.info("[cwa-duplicates] Rendered %s cached duplicate groups", len(duplicate_groups))
+        return render_title_template('duplicates.html',
                                      duplicate_groups=duplicate_groups,
                                      next_scan_run=next_scan_run,
-                                     title=_("Duplicate Books"), 
-                                     page="duplicates")
-                                     
+                                     title=_("Duplicate Books"), page="duplicates")
+
     except Exception as e:
         print(f"[cwa-duplicates] Critical error loading duplicates page: {str(e)}", flush=True)
         log.error("[cwa-duplicates] Critical error loading duplicates page: %s", str(e))
-        # Return empty page on error
-        return render_title_template('duplicates.html', 
-                                     duplicate_groups=[],
+        return render_title_template('duplicates.html', duplicate_groups=[],
                                      next_scan_run=None,
-                                     title=_("Duplicate Books"), 
-                                     page="duplicates")
+                                     title=_("Duplicate Books"), page="duplicates")
 
 
 def get_next_duplicate_scan_run(settings):
@@ -686,14 +762,20 @@ def find_duplicate_books_sql(use_title, use_author, use_language, use_series, us
         book_ids_str = result.book_ids_str
         book_ids = [int(bid) for bid in book_ids_str.split(',')]
         
-        # Load full book objects for these IDs with eager loading
-        books = (calibre_db.session.query(db.Books)
-                .options(joinedload(db.Books.data))
-                .options(joinedload(db.Books.authors))
-                .filter(db.Books.id.in_(book_ids))
-                .filter(get_common_filters(user_id=user_id))
-                .order_by(db.Books.timestamp.desc())
-                .all())
+        # Load full book objects for these IDs with eager loading.
+        # Batch the IN filter so a pathologically large group cannot exceed
+        # SQLite's bound-parameter limit (see _fetch_books_in_chunks).
+        books_base = (calibre_db.session.query(db.Books)
+                      .options(joinedload(db.Books.data))
+                      .options(joinedload(db.Books.authors))
+                      .filter(get_common_filters(user_id=user_id)))
+        books = _fetch_books_in_chunks(books_base, book_ids)
+        # Re-apply ORDER BY timestamp DESC (NULLs last) across batches.
+        # tz-safe key: mixed naive/aware timestamps otherwise raise
+        # "can't compare offset-naive and offset-aware datetimes" — the DB
+        # ORDER BY tolerated it, Python's sort does not.
+        books.sort(key=lambda b: _timestamp_or_default(b.timestamp, _AWARE_MIN),
+                   reverse=True)
         
         if len(books) < 2:
             continue  # Safety check
@@ -766,6 +848,32 @@ def find_duplicate_books_sql(use_title, use_author, use_language, use_series, us
     return duplicate_groups
 
 
+# SQLite caps host parameters per statement at SQLITE_MAX_VARIABLE_NUMBER
+# (32766 since SQLite 3.32, 999 on older builds). A duplicate prefilter on a
+# large library can return >100k candidate IDs, so an unbatched
+# ``Books.id.in_(ids)`` raises "too many SQL variables" and aborts the scan
+# (and, via the after-import cache refresh, leaves the worker churning full
+# scans because the incremental baseline never persists). Stay well under the
+# lowest historical limit for portability.
+_SQLITE_IN_CHUNK = 900
+
+
+def _fetch_books_in_chunks(base_query, ids):
+    """Run ``base_query`` filtered by ``ids`` without exceeding SQLite's
+    bound-parameter limit.
+
+    The id collection is split into ``_SQLITE_IN_CHUNK``-sized batches and the
+    per-batch results concatenated. Ordering only holds within a batch, so
+    callers needing a global order must sort the returned list themselves.
+    """
+    ids = list(ids)
+    books = []
+    for start in range(0, len(ids), _SQLITE_IN_CHUNK):
+        chunk = ids[start:start + _SQLITE_IN_CHUNK]
+        books.extend(base_query.filter(db.Books.id.in_(chunk)).all())
+    return books
+
+
 def find_duplicate_books_python(use_title, use_author, use_language, use_series, use_publisher, use_format,
                                  include_dismissed=False, user_id=None, candidate_ids=None):
     """Original Python-based duplicate detection - fallback for complex scenarios
@@ -790,9 +898,19 @@ def find_duplicate_books_python(use_title, use_author, use_language, use_series,
         if not candidate_ids:
             print("[cwa-duplicates] No candidate IDs provided, returning empty duplicate set", flush=True)
             return []
-        books_query = books_query.filter(db.Books.id.in_(list(candidate_ids)))
-    
-    all_books = books_query.all()
+        # Batch the IN filter: a large prefilter routinely exceeds SQLite's
+        # bound-parameter limit (see _fetch_books_in_chunks).
+        all_books = _fetch_books_in_chunks(books_query, candidate_ids)
+        # Per-batch queries can only order within a batch; restore the global
+        # ORDER BY title ASC, timestamp DESC (NULLs last) via a stable sort.
+        # tz-safe key: mixed naive/aware timestamps otherwise raise
+        # "can't compare offset-naive and offset-aware datetimes" — the DB
+        # ORDER BY tolerated it, Python's sort does not.
+        all_books.sort(key=lambda b: _timestamp_or_default(b.timestamp, _AWARE_MIN),
+                        reverse=True)
+        all_books.sort(key=lambda b: (b.title or ""))
+    else:
+        all_books = books_query.all()
     print(f"[cwa-duplicates] Retrieved {len(all_books)} books with user filtering applied", flush=True)
     
     # Safety check for very large libraries (optional performance warning)
