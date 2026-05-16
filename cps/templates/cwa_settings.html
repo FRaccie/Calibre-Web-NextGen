@@ -984,11 +984,14 @@
       </div>
 
 
-      <!-- Detection Method (Hybrid default) -->
-      {% set scan_method = cwa_settings.get('duplicate_scan_method')|default('hybrid', true) %}
+      <!-- Detection Method (Hash/exact default) -->
+      {% set scan_method = cwa_settings.get('duplicate_scan_method')|default('hash', true) %}
       <div class="form-group" style="display: flex; justify-content: space-between; align-items: baseline; margin-top: 2rem;">
         <label for="duplicate_scan_method" class="settings-section-header" style="margin-top: 8px;">{{_('Duplicate Detection Method')}}</label>
         <select class="cwa-settings-select" name="duplicate_scan_method" id="duplicate_scan_method" style="width: fit-content;">
+          <option value="hash" {% if scan_method == 'hash' %}selected{% endif %}>
+            {{_('Exact file match (fastest — identical files via checksum)')}}
+          </option>
           <option value="hybrid" {% if scan_method == 'hybrid' %}selected{% endif %}>
             {{_('Hybrid (SQL prefilter + Python validation)')}}
           </option>
@@ -1002,7 +1005,7 @@
       </div>
       <div class="cwa-settings-tip">
         <small>
-          {{_('Hybrid mode uses a fast SQL pre-filter to narrow candidates, then applies the robust Python logic for final results.') }}
+          {{_('Exact file match (recommended) groups books with byte-identical files via stored checksums — near-instant, ideal for accidental re-imports. Hybrid/Python/SQL do fuzzy title+author matching (find same work across editions/formats) but are far slower on large libraries.') }}
         </small>
       </div>
 
